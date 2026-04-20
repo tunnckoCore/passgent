@@ -10,8 +10,6 @@
 .env
 .env.*
 !.env.example
-.passgent/
-**/.passgent/
 
 # Logs
 *.log
