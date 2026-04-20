@@ -6,6 +6,6 @@ Consolidated repo for all passgent iterations, preserving the original `passgent
 
 - `passgent-bash` — Bash prototype
 - `passgent-go` — Go iteration
-- `passgent-rs` — Rust iteration (final version)
+- `passgent-rs` — Rust port / in-progress iteration
 
 Local state, generated binaries, and build artifacts are intentionally ignored in the current tree.
