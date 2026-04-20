@@ -1,0 +1,37 @@
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Environment / local-only data
+.env
+.env.*
+!.env.example
+.passgent/
+**/.passgent/
+
+# Logs
+*.log
+
+# Generic build outputs
+dist/
+build/
+bin/
+coverage/
+*.out
+
+# Go
+*.test
+coverage.out
+/passgent-go/passgent-go
+
+# Rust
+/target/
+**/target/
+
+# Misc
+*.tmp
+*.bak

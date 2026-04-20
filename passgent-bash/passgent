@@ -1,0 +1,473 @@
+#!/usr/bin/env bash
+
+# passgent: Minimalist secrets manager powered by age, fzf, and oathtool.
+# Features:
+# - Minimal (like pa)
+# - Uses age for encryption
+# - Supports folders/nesting naturally
+# - Native TOTP support
+# - Configurable clipboard cleanup
+# - Git integration (opt-out available)
+# - fzf fuzzy search
+
+set -e
+
+# Configuration Defaults
+PASSGENT_DIR="${PASSGENT_DIR:-$HOME/.local/share/passgent}"
+PASSGENT_ID_DIR="${PASSGENT_ID_DIR:-$HOME/.config/passgent}"
+PASSGENT_IDENTITY="${PASSGENT_ID_DIR}/identities"
+PASSGENT_RECIPIENT="${PASSGENT_ID_DIR}/recipients"
+PASSGENT_CLIP_TIME="${PASSGENT_CLIP_TIME:-45}"
+PASSGENT_USE_GIT="${PASSGENT_USE_GIT:-true}"
+PASSGENT_EXT="${PASSGENT_EXT:-.age}"
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+ensure_dirs() {
+    mkdir -p "$PASSGENT_DIR"
+    mkdir -p "$PASSGENT_ID_DIR"
+}
+
+_git() {
+    if [ "$PASSGENT_USE_GIT" = "true" ] && [ -d "$PASSGENT_DIR/.git" ]; then
+        git -C "$PASSGENT_DIR" "$@"
+    fi
+}
+
+cmd_init() {
+    ensure_dirs
+
+    if ! command -v age-keygen >/dev/null 2>&1; then
+        die "age is required. Please install 'age'."
+    fi
+
+    if [ ! -f "$PASSGENT_IDENTITY" ]; then
+        echo "Generating age key pair..."
+        age-keygen -o "$PASSGENT_IDENTITY"
+        # Extract public key to recipients file
+        grep 'public key:' "$PASSGENT_IDENTITY" | awk '{print $4}' > "$PASSGENT_RECIPIENT"
+        chmod 600 "$PASSGENT_IDENTITY"
+        echo "Created keys in $PASSGENT_ID_DIR"
+    else
+        echo "Identity file already exists: $PASSGENT_IDENTITY"
+    fi
+
+    if [ "$PASSGENT_USE_GIT" = "true" ] && [ ! -d "$PASSGENT_DIR/.git" ]; then
+        git -C "$PASSGENT_DIR" init
+        _git add .
+        _git commit -m "passgent: Initialize secrets store" || true
+    fi
+}
+
+_get_recipients() {
+    local target="$1"
+    AGE_ARGS=()
+    local recips=()
+    
+    local current_dir="${PASSGENT_DIR}/$(dirname "$target")"
+    while [[ "$current_dir" == "${PASSGENT_DIR}"/* || "$current_dir" == "${PASSGENT_DIR}" ]]; do
+        if [ -f "$current_dir/.age-id" ]; then
+            while read -r line; do
+                [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+                recips+=("$line")
+            done < "$current_dir/.age-id"
+            break
+        fi
+        [ "$current_dir" == "${PASSGENT_DIR}" ] && break
+        current_dir=$(dirname "$current_dir")
+    done
+    
+    # root check fallback
+    if [ ${#recips[@]} -eq 0 ] && [ -f "${PASSGENT_DIR}/.age-id" ]; then
+        while read -r line; do
+            [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+            recips+=("$line")
+        done < "${PASSGENT_DIR}/.age-id"
+    fi
+    
+    # default identity fallback
+    if [ ${#recips[@]} -eq 0 ]; then
+        recips+=("file:${PASSGENT_RECIPIENT}")
+    fi
+    
+    for r in "${recips[@]}"; do
+        if [[ "$r" == github:* ]]; then
+            local gh_user="${r#github:}"
+            local gh_keys
+            gh_keys=$(curl -s "https://github.com/${gh_user}.keys") || die "Failed to fetch keys for github:$gh_user"
+            while read -r key; do
+                [ -n "$key" ] && AGE_ARGS+=("-R" <(echo "$key"))
+            done <<< "$gh_keys"
+        elif [[ "$r" == file:* ]]; then
+            AGE_ARGS+=("-R" "${r#file:}")
+        else
+            AGE_ARGS+=("-r" "$r")
+        fi
+    done
+}
+
+# The core encrypt/decrypt wrappers
+encrypt() {
+    local target="$1"
+    if [ ! -f "$PASSGENT_RECIPIENT" ]; then
+        die "No recipients file found. Run 'passgent init' first."
+    fi
+    _get_recipients "$target"
+    age "${AGE_ARGS[@]}"
+}
+
+decrypt() {
+    if [ ! -f "$PASSGENT_IDENTITY" ]; then
+        die "No identity file found. Run 'passgent init' first."
+    fi
+    age -d -i "$PASSGENT_IDENTITY"
+}
+
+_get_path() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        die "Pass a secret name (e.g., github/personal)."
+    fi
+    echo "${PASSGENT_DIR}/${target}${PASSGENT_EXT}"
+}
+
+cmd_add() {
+    local target="$1"
+    local custom_pass="$2"
+    local file="$(_get_path "$target")"
+    mkdir -p "$(dirname "$file")"
+
+    if [ -n "$custom_pass" ]; then
+        echo "$custom_pass" | encrypt "$target" > "$file"
+        echo "Saved $target with provided secret."
+    elif [ ! -t 0 ]; then
+        local input
+        input=$(cat)
+        if [ -n "$input" ]; then
+            echo "$input" | encrypt "$target" > "$file"
+            echo "Saved $target from stdin."
+        else
+            local gen_pass
+            gen_pass=$(LC_ALL=C tr -dc 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+' < /dev/urandom | head -c 64)
+            echo "$gen_pass" | encrypt "$target" > "$file"
+            echo "Generated 64-character password for $target."
+        fi
+    else
+        # Auto-generate 64 length password
+        local gen_pass
+        gen_pass=$(LC_ALL=C tr -dc 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+' < /dev/urandom | head -c 64)
+        echo "$gen_pass" | encrypt "$target" > "$file"
+        echo "Generated 64-character password for $target."
+    fi
+
+    if [ "$PASSGENT_USE_GIT" = "true" ]; then
+        _git add "${file}"
+        _git commit -m "passgent: Add ${target}" || true
+    fi
+}
+
+cmd_edit() {
+    local target="$1"
+    local file="$(_get_path "$target")"
+    if [ ! -f "$file" ]; then
+        die "Secret $target does not exist. Use 'passgent add $target' first."
+    fi
+
+    local tmpfile
+    tmpfile=$(mktemp)
+    trap 'rm -f "$tmpfile"' EXIT
+
+    decrypt < "$file" > "$tmpfile"
+    command nano "$tmpfile"
+
+    cat "$tmpfile" | encrypt "$target" > "$file"
+
+    if [ "$PASSGENT_USE_GIT" = "true" ]; then
+        _git add "${file}"
+        _git commit -m "passgent: Edit ${target}" || true
+    fi
+    echo "Updated $target"
+}
+
+cmd_show() {
+    local target="$1"
+    local file="$(_get_path "$target")"
+    if [ ! -f "$file" ]; then
+        die "Secret $target does not exist."
+    fi
+    decrypt < "$file"
+}
+
+cmd_ls() {
+    local prefix="$1"
+    local dir="${PASSGENT_DIR}/${prefix}"
+    if [ ! -d "$dir" ]; then
+        dir="$PASSGENT_DIR"
+    fi
+    # List files, strip the base directory path, and strip the .age extension
+    if [ -d "$dir" ]; then
+        find "$dir" -type f -name "*${PASSGENT_EXT}" | sed "s|^${PASSGENT_DIR}/||" | sed "s|${PASSGENT_EXT}$||" | sort
+    fi
+}
+
+cmd_search() {
+    if ! command -v fzf >/dev/null 2>&1; then
+        die "fzf is required for search. Install it or use 'passgent ls'."
+    fi
+    local selected
+    selected=$(cmd_ls | fzf --prompt="passgent> " --preview="passgent show {}" --preview-window=up:3:wrap)
+    if [ -n "$selected" ]; then
+        cmd_show "$selected"
+    fi
+}
+
+_clip() {
+    local content="$1"
+    if command -v wl-copy >/dev/null 2>&1; then
+        printf "%s" "$content" | wl-copy
+    elif command -v xclip >/dev/null 2>&1; then
+        printf "%s" "$content" | xclip -selection clipboard
+    elif command -v pbcopy >/dev/null 2>&1; then
+        printf "%s" "$content" | pbcopy
+    else
+        die "No clipboard manager found (wl-copy, xclip, or pbcopy)."
+    fi
+}
+
+cmd_copy() {
+    local target="$1"
+    local file="$(_get_path "$target")"
+    if [ ! -f "$file" ]; then
+        die "Secret $target does not exist."
+    fi
+
+    local secret
+    secret=$(decrypt < "$file" | head -n 1)
+
+    _clip "$secret"
+    echo "Copied $target to clipboard. Clearing in $PASSGENT_CLIP_TIME seconds..."
+
+    (
+        sleep "$PASSGENT_CLIP_TIME"
+        _clip ""
+    ) & disown
+}
+
+cmd_otp() {
+    local target="$1"
+    local file="$(_get_path "$target")"
+    if [ ! -f "$file" ]; then
+        die "Secret $target does not exist."
+    fi
+    if ! command -v oathtool >/dev/null 2>&1; then
+        die "oathtool is required for OTP support. Please install 'oathtool'."
+    fi
+
+    local content
+    content=$(decrypt < "$file")
+
+    # Try parsing format: `totp: base32secret`
+    local secret
+    secret=$(echo "$content" | grep -i '^totp:' | head -n 1 | awk '{print $2}' | tr -d ' ' | tr -d '\r')
+
+    # Try parsing format: `otpauth://totp/Issuer:account?secret=base32secret`
+    if [ -z "$secret" ]; then
+        secret=$(echo "$content" | grep -i '^otpauth://' | head -n 1 | sed -n 's/.*secret=\([A-Z2-7]*\).*/\1/pi' | tr -d ' ' | tr -d '\r')
+    fi
+
+    if [ -z "$secret" ]; then
+        die "No valid TOTP secret found in $target. Add 'totp: YOURSECRET' or an 'otpauth://...' uri on a new line."
+    fi
+
+    local code
+    code=$(oathtool --totp -b "$secret")
+
+    echo "$code"
+
+    if [ "$2" = "--copy" ] || [ "$2" = "-c" ]; then
+        _clip "$code"
+        echo "OTP copied to clipboard. Clearing in $PASSGENT_CLIP_TIME seconds..."
+        (
+            sleep "$PASSGENT_CLIP_TIME"
+            _clip ""
+        ) & disown
+    fi
+}
+
+cmd_spectre() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        die "Usage: passgent spectre <siteName>"
+    fi
+    
+    local file="$(_get_path "spectre")"
+    if [ ! -f "$file" ]; then
+        die "Master spectre secret not found. Create it with 'passgent add spectre \"masterName:masterPass\"'."
+    fi
+    
+    local content
+    content=$(decrypt < "$file")
+    local masterName
+    masterName=$(echo "$content" | cut -d':' -f1)
+    local masterPass
+    masterPass=$(echo "$content" | cut -d':' -f2)
+    
+    if [ -z "$masterName" ] || [ -z "$masterPass" ]; then
+        die "Invalid spectre secret format. Expected 'name:password'."
+    fi
+    
+    local script="$PASSGENT_ID_DIR/spectre-env/spectre.js"
+    if [ ! -f "$script" ]; then
+        die "Spectre environment not setup. Run 'passgent setup' first."
+    fi
+    
+    local code
+    if command -v bun >/dev/null 2>&1; then
+        code=$(bun "$script" "$masterName" "$masterPass" "$target")
+    elif command -v node >/dev/null 2>&1; then
+        code=$(node "$script" "$masterName" "$masterPass" "$target")
+    else
+        die "Node or Bun is required to run the Spectre algorithm."
+    fi
+    
+    echo "$code"
+    
+    if [ "$2" = "--copy" ] || [ "$2" = "-c" ]; then
+        _clip "$code"
+        echo "Spectre password copied to clipboard. Clearing in $PASSGENT_CLIP_TIME seconds..."
+        (
+            sleep "$PASSGENT_CLIP_TIME"
+            _clip ""
+        ) & disown
+    fi
+}
+
+cmd_setup() {
+    echo "Detecting OS for dependencies..."
+    if command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update && sudo apt-get install -y age fzf oathtool curl jq xclip
+    elif command -v apk >/dev/null 2>&1; then
+        sudo apk add age fzf oath-toolkit-oathtool curl jq xclip
+    elif command -v pacman >/dev/null 2>&1; then
+        sudo pacman -Sy age fzf oath-toolkit curl jq xclip
+    elif command -v dnf >/dev/null 2>&1; then
+        sudo dnf install age fzf oathtool curl jq xclip
+    elif command -v brew >/dev/null 2>&1; then
+        brew install age fzf oath-toolkit curl jq
+    else
+        echo "Could not detect package manager. Please install age, fzf, oathtool, curl, and jq manually."
+    fi
+
+    echo "Setting up Spectre algorithm dependencies..."
+    ensure_dirs
+    mkdir -p "$PASSGENT_ID_DIR/spectre-env"
+    
+    if command -v bun >/dev/null 2>&1; then
+        (cd "$PASSGENT_ID_DIR/spectre-env" && bun init -y >/dev/null 2>&1 && bun add @noble/hashes micro-key-producer >/dev/null 2>&1)
+    elif command -v npm >/dev/null 2>&1; then
+        (cd "$PASSGENT_ID_DIR/spectre-env" && npm init -y >/dev/null 2>&1 && npm install @noble/hashes micro-key-producer >/dev/null 2>&1)
+    else
+        echo "bun or npm not found. Spectre support will be limited/unavailable."
+    fi
+    
+    cat << 'EOF' > "$PASSGENT_ID_DIR/spectre-env/spectre.js"
+const { pbkdf2 } = require('@noble/hashes/pbkdf2');
+const { hmac } = require('@noble/hashes/hmac');
+const { sha256 } = require('@noble/hashes/sha256');
+const { mask } = require('micro-key-producer/password.js');
+
+const masterName = process.argv[2];
+const masterPass = process.argv[3];
+const siteName = process.argv[4];
+
+if (!masterName || !masterPass || !siteName) {
+    console.error("Usage: spectre.js <masterName> <masterPass> <siteName>");
+    process.exit(1);
+}
+
+const toBytes = (str) => new TextEncoder().encode(str);
+
+const userKey = pbkdf2(sha256, toBytes(masterPass), toBytes(masterName), {
+    c: 524288,
+    dkLen: 64
+});
+
+const secret = hmac(sha256, userKey, siteName);
+const { password } = mask('111vvc-CvAvc1-cAvv1').apply(secret);
+
+console.log(password);
+EOF
+    echo "Setup complete!"
+}
+
+cmd_rm() {
+    local target="$1"
+    local file="$(_get_path "$target")"
+    if [ ! -f "$file" ]; then
+        die "Secret $target does not exist."
+    fi
+
+    rm -f "$file"
+    # cleanup empty dirs safely
+    rmdir -p "$(dirname "$file")" 2>/dev/null || true
+
+    if [ "$PASSGENT_USE_GIT" = "true" ]; then
+        _git rm "${file}" || true
+        _git commit -m "passgent: Remove ${target}" || true
+    fi
+    echo "Removed $target"
+}
+
+cmd_help() {
+    cat <<EOF
+passgent - Minimalist secrets manager (age + git + fzf + oathtool)
+
+Usage:
+  passgent setup                Install dependencies (age, fzf, oathtool, etc)
+  passgent init                 Initialize storage and identity
+  passgent ls [prefix]          List secrets
+  passgent add <name> [secret]  Add a new secret. Auto-generates 64-char pass if omitted.
+  passgent show <name>          Show a secret
+  passgent copy | -c <name>     Copy the first line to clipboard
+  passgent edit <name>          Edit a secret in nano/\$EDITOR
+  passgent rm <name>            Remove a secret
+  passgent search               Fuzzy search using fzf
+  passgent otp <name> [-c]      Generate TOTP code (add -c to copy)
+  passgent spectre <site> [-c]  Generate password via Spectre v4 using 'spectre' secret
+  passgent help                 Show this help
+
+Config via Env:
+  PASSGENT_DIR        (default: ~/.local/share/passgent)
+  PASSGENT_ID_DIR     (default: ~/.config/passgent)
+  PASSGENT_CLIP_TIME  (default: 45)
+  PASSGENT_USE_GIT    (default: true)
+EOF
+}
+
+cmd="${1:-search}"
+
+if [ "$cmd" != "search" ]; then
+    shift || true
+fi
+
+case "$cmd" in
+    init) cmd_init "$@" ;;
+    setup) cmd_setup "$@" ;;
+    add) cmd_add "$@" ;;
+    show) cmd_show "$@" ;;
+    edit) cmd_edit "$@" ;;
+    ls) cmd_ls "$@" ;;
+    search) cmd_search "$@" ;;
+    copy|-c|c) cmd_copy "$@" ;;
+    otp|totp) cmd_otp "$@" ;;
+    spectre) cmd_spectre "$@" ;;
+    rm) cmd_rm "$@" ;;
+    help|--help|-h) cmd_help ;;
+    *)
+        if [ "$cmd" = "search" ]; then
+            cmd_search
+        else
+            cmd_show "$cmd" || cmd_help
+        fi
+        ;;
+esac
