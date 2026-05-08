@@ -11,7 +11,7 @@ hex = "0.4.3"
 hmac = "0.12.1"
 pbkdf2 = "0.12.2"
 rand = "0.10.0"
-rpassword = "7.4.0"
+rpassword = "7.5.0"
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.10.9"
 toml = "1.0.3"
